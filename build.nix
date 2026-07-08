@@ -3,6 +3,7 @@
   lib,
   python3,
   qt6,
+    xcbutilcursor,
   makeWrapper,
   copyDesktopItems,
   makeDesktopItem,
@@ -36,7 +37,7 @@ in
       copyDesktopItems
     ];
 
-  buildInputs = [ pythonEnv qt6.qtbase ];
+    buildInputs = [ pythonEnv qt6.qtbase qt6.qtwayland xcbutilcursor ];
 
     # Port the app to PySide6/Qt6 at build time
     postPatch = ''
@@ -72,9 +73,7 @@ in
       mkdir -p $out/bin
       makeWrapper ${pythonEnv}/bin/python $out/bin/kohighlights \
         --add-flags "$out/share/kohighlights/main.py" \
-        --set QT_DEBUG_PLUGINS "1" \
-        --prefix PYTHONPATH : "$out/share/kohighlights" \
-  --prefix QT_PLUGIN_PATH : "${qt6.qtbase}/${qt6.qtbase.qtPluginPrefix}"
+        --prefix PYTHONPATH : "$out/share/kohighlights"
 
       # Install icon (replace with your actual icon file)
       if [ -f ./icon.png ]; then
