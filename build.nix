@@ -75,11 +75,9 @@ in
         --add-flags "$out/share/kohighlights/main.py" \
         --prefix PYTHONPATH : "$out/share/kohighlights"
 
-      # Install icon (replace with your actual icon file)
-      if [ -f ./icon.png ]; then
-        mkdir -p $out/share/icons/hicolor/48x48/apps
-        cp ./icon.png $out/share/icons/hicolor/48x48/apps/kohighlights.png
-      fi
+      # Install the application icon, so the .desktop launcher can find it
+      install -Dm644 ./stuff/logo64.png \
+        $out/share/icons/hicolor/64x64/apps/kohighlights.png
 
       runHook postInstall
     '';
