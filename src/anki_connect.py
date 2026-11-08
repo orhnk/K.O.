@@ -11,6 +11,7 @@ AnkiConnect API documentation: https://foosoft.net/projects/anki-connect/
 import json
 import urllib.request
 import urllib.error
+from datetime import date, datetime
 from typing import Optional, List, Dict, Any, Tuple
 
 __author__ = "KOHighlights"
@@ -35,6 +36,90 @@ DEFAULT_FIELD_MAPPINGS = {
     "author": "Author",
     "uid": "UID"
 }
+
+# Anki's built-in deck, selected by a lone "/" bookmark/comment directive
+DEFAULT_DECK_NAME = "Default"
+
+
+def parse_deck_directive(note: str) -> Tuple[Optional[str], str]:
+    """Split an optional leading ``/deck`` directive from a bookmark/comment.
+
+    The directive has to be the first non-empty line of the note:
+
+    * ``/``          -> the Anki default deck (``Default``)
+    * ``/mydeck``    -> the deck ``mydeck``
+
+    Everything after the directive line is kept as the actual note.
+
+    :param note: The raw bookmark/comment text
+    :return: Tuple of (deck name or None, note without the directive)
+    """
+    if not note:
+        return None, note or ""
+
+    lines = str(note).replace("\\\n", "\n").split("\n")
+    first_idx = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first_idx is None:
+        return None, str(note)
+
+    first = lines[first_idx].strip()
+    if not first.startswith("/"):
+        return None, str(note)
+
+    deck = first[1:].strip() or DEFAULT_DECK_NAME
+    rest = lines[first_idx + 1:]
+    while rest and not rest[0].strip():  # drop blank lines right after the directive
+        rest.pop(0)
+    return deck, "\n".join(rest).strip()
+
+
+def highlight_date(value) -> Optional[date]:
+    """Parse the date part of a KOReader datetime string."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    text = str(value).strip()
+    try:
+        return datetime.fromisoformat(text).date()
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def filter_highlights_by_date(highlights: List[Dict], start_date: Optional[date] = None,
+                              end_date: Optional[date] = None) -> List[Dict]:
+    """Keep only highlights whose date lies inside the given (inclusive) range.
+
+    Highlights without a parseable date are dropped when a range is active.
+
+    :param highlights: Highlight dictionaries with a ``date`` key
+    :param start_date: First allowed day (inclusive)
+    :param end_date: Last allowed day (inclusive)
+    :return: Filtered list of highlights
+    """
+    if start_date is None and end_date is None:
+        return list(highlights)
+
+    filtered = []
+    for highlight in highlights:
+        day = highlight_date(highlight.get("date") or highlight.get("datetime"))
+        if day is None:
+            continue
+        if start_date is not None and day < start_date:
+            continue
+        if end_date is not None and day > end_date:
+            continue
+        filtered.append(highlight)
+    return filtered
 
 
 class AnkiConnectError(Exception):
@@ -377,17 +462,8 @@ class AnkiConnect:
             "Front": """
 <div class="card-body">
     <div class="panel">
-        {{#Back}}
-        <div class="comment">{{Back}}</div>
-        {{/Back}}
-        {{^Back}}
-            {{#Front}}
-            <div class="comment">{{Front}}</div>
-            {{/Front}}
-            {{^Front}}
-            <div class="comment empty">💬 Keine Notiz</div>
-            {{/Front}}
-        {{/Back}}
+        {{#Front}}<div class="highlight">{{Front}}</div>{{/Front}}
+        {{^Front}}<div class="comment empty">💬 Keine Notiz</div>{{/Front}}
         <hr class="divider short">
         {{#Source}}<div class="title">{{Source}}</div>{{/Source}}
     </div>
@@ -399,7 +475,8 @@ class AnkiConnect:
 <div class="card-body">
     <div class="panel">
         {{#Source}}<div class="title">{{Source}}</div>{{/Source}}
-        {{#Front}}<div class="highlight">{{Front}}</div>{{/Front}}
+        {{#Back}}<div class="comment">{{Back}}</div>{{/Back}}
+        {{^Back}}<div class="comment empty">💬 Keine Notiz</div>{{/Back}}
         {{#Author}}<div class="author">~{{Author}}</div>{{/Author}}
         {{#Page}}{{#Chapter}}<div class="pagech">{{Page}} – {{Chapter}}</div>{{/Chapter}}{{/Page}}
         {{#Page}}{{^Chapter}}<div class="pagech">{{Page}}</div>{{/Chapter}}{{/Page}}
@@ -701,7 +778,7 @@ class AnkiConnect:
                             tags: Optional[List[str]] = None,
                             allow_duplicate: bool = False,
                             progress_callback: Optional[callable] = None,
-                            front_content: str = "comment") -> Tuple[int, int, List[str]]:
+                            front_content: str = "highlight") -> Tuple[int, int, List[str]]:
         """
         Add multiple highlights as notes.
         
@@ -787,22 +864,17 @@ class AnkiConnect:
             if not any(str(val).strip() for val in fields.values()):
                 fallback_field = highlight_field_name or available_fields[0]
                 fields[fallback_field] = base_highlight or base_comment
-            # If there is no comment, copy the highlight into the comment field (keep highlight field intact for Front)
-            if not base_comment and base_highlight:
-                target_comment_field = comment_field_name
-                if not target_comment_field:
-                    target_comment_field = "Back" if "Back" in available_fields else pick_fallback([available_fields[0]])
-                if target_comment_field:
-                    fields[target_comment_field] = base_highlight
 
-            # Apply front/back preference
-            if front_content == "highlight" and highlight_field_name:
-                highlight_val = fields.get(highlight_field_name, "")
-                comment_val = fields.get(comment_field_name, fields.get("Back", ""))
-                if highlight_val:
-                    fields["Front"] = highlight_val
-                if comment_val:
-                    fields["Back"] = comment_val
+            # Highlight text on the front and bookmark/comment on the back by default.
+            # Only swap them when the user explicitly wants the comment on the front.
+            if (highlight_field_name == "Front" and comment_field_name == "Back"
+                    and "Front" in available_fields and "Back" in available_fields):
+                if front_content == "comment" and base_comment:
+                    fields["Front"] = base_comment
+                    fields["Back"] = base_highlight
+                else:
+                    fields["Front"] = base_highlight
+                    fields["Back"] = base_comment
 
             # Final guard: if still empty after front/back adjustments, skip
             if not any(str(val).strip() for val in fields.values()):
@@ -933,5 +1005,9 @@ __all__ = [
     "DEFAULT_ANKI_VERSION",
     "DEFAULT_NOTE_TYPE",
     "DEFAULT_CLOZE_TYPE",
-    "DEFAULT_FIELD_MAPPINGS"
+    "DEFAULT_FIELD_MAPPINGS",
+    "DEFAULT_DECK_NAME",
+    "parse_deck_directive",
+    "highlight_date",
+    "filter_highlights_by_date"
 ]

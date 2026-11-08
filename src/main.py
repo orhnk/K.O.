@@ -13,9 +13,8 @@ from datetime import datetime
 from functools import partial
 from copy import deepcopy
 from collections import defaultdict
-from ntpath import normpath
 from os.path import (isdir, isfile, join, basename, splitext, dirname, split, getmtime,
-                     abspath, splitdrive)
+                     abspath, splitdrive, normpath)
 from pprint import pprint
 
 if QT5:
@@ -44,7 +43,7 @@ import pickle
 
 
 __author__ = "noEmbryo"
-__version__ = "2.3.1.0"
+__version__ = "2.3.1.1"
 
 
 class Base(QMainWindow, Ui_Base):
@@ -733,13 +732,12 @@ class Base(QMainWindow, Ui_Base):
                     else:  # older type file
                         value = data[stats][key]
 
-                    # no total pages if reference pages are used
+                    # use pagemap total pages if reference pages are used
                     annotations = data.get("annotations")  # new type metadata
                     if self.show_ref_pg and annotations is not None and len(annotations):
-                        annot = annotations[1]  # first annotation
-                        ref_page = annot.get("pageref")
+                        ref_page = annotations[1].get("pageref")  # check first annotation
                         if ref_page and ref_page.isdigit():  # there is a ref page number
-                            value = _("|Ref|")
+                            value = data.get("pagemap_doc_pages", _("|Ref|"))
                 elif key == "keywords":
                     keywords = data["doc_props"][key].split("\n")
                     value = "; ".join([i.rstrip("\\") for i in keywords])

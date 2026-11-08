@@ -11,31 +11,33 @@ This module provides the GUI components for Anki integration:
 from boot_config import *
 from boot_config import _
 import json
+from datetime import date
 from functools import partial
 from typing import Optional, List, Dict, Any
 
 if QT5:
-    from PySide2.QtCore import Qt, QTimer, Signal, Slot, QThread
+    from PySide2.QtCore import Qt, QTimer, Signal, Slot, QThread, QDate
     from PySide2.QtWidgets import (QWidget, QDialog, QVBoxLayout, QHBoxLayout, 
                                    QGridLayout, QGroupBox, QLabel, QLineEdit,
                                    QComboBox, QPushButton, QCheckBox, QListWidget,
-                                   QListWidgetItem, QProgressBar, QTextEdit,
+                                   QListWidgetItem, QProgressBar, QTextEdit, QDateEdit,
                                    QDialogButtonBox, QFrame, QMessageBox, QSpacerItem,
                                    QSizePolicy, QApplication)
     from PySide2.QtGui import QIcon
 else:  # Qt6
-    from PySide6.QtCore import Qt, QTimer, Signal, Slot, QThread
+    from PySide6.QtCore import Qt, QTimer, Signal, Slot, QThread, QDate
     from PySide6.QtWidgets import (QWidget, QDialog, QVBoxLayout, QHBoxLayout,
                                    QGridLayout, QGroupBox, QLabel, QLineEdit,
                                    QComboBox, QPushButton, QCheckBox, QListWidget,
-                                   QListWidgetItem, QProgressBar, QTextEdit,
+                                   QListWidgetItem, QProgressBar, QTextEdit, QDateEdit,
                                    QDialogButtonBox, QFrame, QMessageBox, QSpacerItem,
                                    QSizePolicy, QApplication)
     from PySide6.QtGui import QIcon
 
 from anki_connect import (AnkiConnect, AnkiConnectError, get_anki_connect,
                           DEFAULT_ANKI_URL, DEFAULT_NOTE_TYPE, DEFAULT_FIELD_MAPPINGS,
-                          MAKHFOUZ_NOTE_TYPE)
+                          MAKHFOUZ_NOTE_TYPE, DEFAULT_DECK_NAME, parse_deck_directive,
+                          highlight_date, filter_highlights_by_date)
 
 __author__ = "KOHighlights"
 
@@ -49,7 +51,7 @@ class AnkiExportThread(QThread):
     
     def __init__(self, anki: AnkiConnect, deck_name: str, model_name: str,
                  highlights: List[Dict], field_mapping: Dict, tags: List[str],
-                 allow_duplicate: bool, create_subdecks: bool, front_content: str = "comment", parent=None):
+                 allow_duplicate: bool, create_subdecks: bool, front_content: str = "highlight", parent=None):
         super().__init__(parent)
         self.anki = anki
         self.deck_name = deck_name
@@ -201,9 +203,11 @@ class AnkiPrefsWidget(QWidget):
         front_layout = QHBoxLayout()
         front_layout.addWidget(QLabel(_("Front shows:")))
         self.front_content_combo = QComboBox()
-        self.front_content_combo.addItem(_("Comment & metadata"), "comment")
         self.front_content_combo.addItem(_("Highlight text"), "highlight")
-        self.front_content_combo.setToolTip(_("Choose whether the card front shows your comment or the highlight"))
+        self.front_content_combo.addItem(_("Comment & metadata"), "comment")
+        self.front_content_combo.setCurrentIndex(self.front_content_combo.findData("highlight"))
+        self.front_content_combo.setToolTip(
+            _("Choose whether the card front shows the highlight or your comment/bookmark"))
         front_layout.addWidget(self.front_content_combo)
         front_layout.addStretch()
         options_layout.addLayout(front_layout)
@@ -344,7 +348,7 @@ class AnkiPrefsWidget(QWidget):
             "include_page": self.include_page_chk.isChecked(),
             "include_date": self.include_date_chk.isChecked(),
             "show_export_dialog": self.show_export_dialog_chk.isChecked(),
-            "front_content": self.front_content_combo.currentData(),
+            "front_content": self.front_content_combo.currentData() or "highlight",
             "field_mappings": getattr(self, '_field_mappings', DEFAULT_FIELD_MAPPINGS.copy())
         }
     
@@ -672,6 +676,34 @@ class AnkiExportDialog(QDialog):
         
         books_layout.addWidget(summary_frame)
         layout.addWidget(books_group)
+
+        # Date Range
+        date_group = QGroupBox(_("Date Range"))
+        date_layout = QHBoxLayout(date_group)
+
+        self.date_filter_chk = QCheckBox(_("Only export highlights between"))
+        self.date_filter_chk.setChecked(False)
+        self.date_filter_chk.setToolTip(
+            _("Limit the export to highlights created in the selected date range"))
+        date_layout.addWidget(self.date_filter_chk)
+
+        self.start_date_edit = QDateEdit()
+        self.start_date_edit.setCalendarPopup(True)
+        self.start_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.start_date_edit.setEnabled(False)
+        date_layout.addWidget(self.start_date_edit)
+
+        date_layout.addWidget(QLabel(_("and")))
+
+        self.end_date_edit = QDateEdit()
+        self.end_date_edit.setCalendarPopup(True)
+        self.end_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.end_date_edit.setEnabled(False)
+        date_layout.addWidget(self.end_date_edit)
+
+        date_layout.addStretch()
+        layout.addWidget(date_group)
+        self._set_date_bounds()
         
         # Deck Settings
         deck_group = QGroupBox(_("Deck Settings"))
@@ -795,6 +827,10 @@ class AnkiExportDialog(QDialog):
         self.select_all_btn.clicked.connect(self._select_all_books)
         self.select_none_btn.clicked.connect(self._select_none_books)
         self.books_list.itemChanged.connect(self._update_summary)
+
+        self.date_filter_chk.stateChanged.connect(self._on_date_filter_changed)
+        self.start_date_edit.dateChanged.connect(self._update_summary)
+        self.end_date_edit.dateChanged.connect(self._update_summary)
         
         self.deck_combo.currentTextChanged.connect(self._update_deck_preview)
         self.create_subdecks_chk.stateChanged.connect(self._update_deck_preview)
@@ -866,6 +902,56 @@ class AnkiExportDialog(QDialog):
         """Deselect all books."""
         for i in range(self.books_list.count()):
             self.books_list.item(i).setCheckState(Qt.Unchecked)
+
+    @staticmethod
+    def _qdate_to_date(qdate) -> date:
+        """Convert a QDate to a Python date (works with Qt5 and Qt6)."""
+        return date(qdate.year(), qdate.month(), qdate.day())
+
+    def _set_date_bounds(self):
+        """Pre-fill the date edits with the earliest/latest highlight dates."""
+        dates = [day for day in (highlight_date(h.get("date") or h.get("datetime"))
+                                 for book in self.books_data
+                                 for h in book.get("highlights", []))
+                 if day is not None]
+        if not dates:
+            self.date_filter_chk.setEnabled(False)
+            self.date_filter_chk.setChecked(False)
+            self.start_date_edit.setDate(QDate.currentDate())
+            self.end_date_edit.setDate(QDate.currentDate())
+            return
+        first, last = min(dates), max(dates)
+        self.start_date_edit.setDate(QDate(first.year, first.month, first.day))
+        self.end_date_edit.setDate(QDate(last.year, last.month, last.day))
+
+    def _get_date_range(self):
+        """Return the active (start, end) dates or (None, None)."""
+        if not self.date_filter_chk.isChecked():
+            return None, None
+        start = self._qdate_to_date(self.start_date_edit.date())
+        end = self._qdate_to_date(self.end_date_edit.date())
+        if start > end:  # keep the range usable if the user swaps the dates
+            start, end = end, start
+            self.start_date_edit.setDate(QDate(start.year, start.month, start.day))
+            self.end_date_edit.setDate(QDate(end.year, end.month, end.day))
+        return start, end
+
+    def _highlight_in_range(self, highlight: Dict) -> bool:
+        """Check whether a highlight falls inside the selected date range."""
+        start, end = self._get_date_range()
+        return bool(filter_highlights_by_date([highlight], start, end))
+
+    def _filtered_highlights(self, book: Dict) -> List[Dict]:
+        """Get a book's highlights that pass the date filter."""
+        start, end = self._get_date_range()
+        return filter_highlights_by_date(book.get("highlights", []), start, end)
+
+    def _on_date_filter_changed(self, state):
+        """Enable/disable the date edits and refresh the counters."""
+        enabled = self.date_filter_chk.isChecked()
+        self.start_date_edit.setEnabled(enabled)
+        self.end_date_edit.setEnabled(enabled)
+        self._update_summary()
     
     def _update_summary(self):
         """Update the books summary label."""
@@ -877,7 +963,7 @@ class AnkiExportDialog(QDialog):
             if item.checkState() == Qt.Checked:
                 book = item.data(Qt.UserRole)
                 books_count += 1
-                highlights_count += len(book.get("highlights", []))
+                highlights_count += len(self._filtered_highlights(book))
         
         self.summary_label.setText(
             _("{} books selected, {} highlights total").format(books_count, highlights_count)
@@ -955,7 +1041,7 @@ class AnkiExportDialog(QDialog):
             item = self.books_list.item(i)
             if item.checkState() == Qt.Checked:
                 book = item.data(Qt.UserRole)
-                highlights = book.get("highlights", [])
+                highlights = self._filtered_highlights(book)
                 if highlights:
                     highlight_data = highlights[0].copy()
                     highlight_data["book_title"] = book.get("title", "")
@@ -970,12 +1056,24 @@ class AnkiExportDialog(QDialog):
         front_field = mapping.get("highlight", "Front")
         back_field = mapping.get("comment", "Back")
 
-        front_content = highlight_data.get("highlight", highlight_data.get("text", ""))
+        highlight_text = highlight_data.get("highlight", highlight_data.get("text", ""))
+        comment_text = highlight_data.get("comment", "")
+        deck, comment_text = parse_deck_directive(comment_text)
+
+        front_mode = self.settings.get("front_content", "highlight")
+        if front_mode == "comment" and comment_text:
+            front_content, back_text = comment_text, highlight_text
+        else:
+            front_content, back_text = highlight_text, comment_text
+
         back_header = f"<b>{back_field}:</b><br>" if back_field else ""
         
         front = f"<b>{front_field}:</b><br>{front_content}"
         back = back_header
         parts = []
+
+        if deck:
+            parts.append(f"🗂 {_('Deck')}: {deck}")
         
         if self.include_book_info_chk.isChecked():
             title = highlight_data.get("book_title", "")
@@ -996,13 +1094,12 @@ class AnkiExportDialog(QDialog):
                 parts.append(f"📄 Page {page}")
         
         if self.include_date_chk.isChecked():
-            date = highlight_data.get("date", "")
-            if date:
-                parts.append(f"📅 {date}")
+            date_text = highlight_data.get("date", "")
+            if date_text:
+                parts.append(f"📅 {date_text}")
         
-        comment = highlight_data.get("comment", "")
-        if comment:
-            parts.append(f"💭 {comment}")
+        if back_text:
+            parts.append(f"💭 {back_text}")
         
         back += "<br>".join(parts)
         
@@ -1035,8 +1132,12 @@ class AnkiExportDialog(QDialog):
             author = book.get("author", "")
             
             for highlight in book.get("highlights", []):
+                if not self._highlight_in_range(highlight):
+                    continue
+
                 highlight_text = highlight.get("text", highlight.get("highlight", ""))
-                comment_text = highlight.get("comment", "")
+                deck, comment_text = parse_deck_directive(highlight.get("comment", ""))
+                deck = deck or highlight.get("deck")
 
                 # Skip notes with no meaningful content to avoid Anki "empty note" errors
                 if not (highlight_text.strip() or comment_text.strip()):
@@ -1051,6 +1152,8 @@ class AnkiExportDialog(QDialog):
                     "book_title": book_title if self.include_book_info_chk.isChecked() else "",
                     "author": author if self.include_book_info_chk.isChecked() else "",
                 }
+                if deck:
+                    prepared["deck"] = deck
                 # carry uid through if available
                 if "uid" in highlight:
                     prepared["uid"] = highlight.get("uid")
@@ -1094,67 +1197,70 @@ class AnkiExportDialog(QDialog):
         total_fail = 0
         all_errors = []
 
+        # Create the decks and group each book's highlights by target deck
+        book_entries = []
+        for book in selected_books:
+            book_title = book.get("title", _("Unknown"))
+
+            highlights = self._prepare_highlights([book])
+            if not highlights:
+                all_errors.append(
+                    _("Skipped book '{}' because it has no non-empty highlights.")
+                    .format(book_title))
+                continue
+
+            if create_subdecks:
+                default_deck = self.anki.create_deck_hierarchy(parent_deck, book_title)
+            else:
+                default_deck = parent_deck or DEFAULT_DECK_NAME
+                if not self.anki.deck_exists(default_deck):
+                    self.anki.create_deck(default_deck)
+
+            groups = {}
+            for highlight in highlights:
+                groups.setdefault(highlight.get("deck") or default_deck, []).append(highlight)
+            book_entries.append((book_title, groups))
+
         # Optionally delete target deck(s) before export
         if overwrite_deck:
-            deck_names_to_delete = set()
-            for book in selected_books:
-                book_title = book.get("title", _("Unknown"))
-                if create_subdecks:
-                    safe_title = self.anki._sanitize_deck_name(book_title)
-                    deck_name = f"{parent_deck}::{safe_title}" if parent_deck else safe_title
-                else:
-                    deck_name = parent_deck
-                deck_names_to_delete.add(deck_name)
+            deck_names_to_delete = {deck for _, groups in book_entries for deck in groups}
             try:
                 if deck_names_to_delete:
                     self.anki.delete_decks(list(deck_names_to_delete), cards_too=True)
             except AnkiConnectError as e:
-                all_errors.append(_("Deck deletion failed: {}".format(str(e))))
+                all_errors.append(_("Deck deletion failed: {}").format(str(e)))
                 # Proceed with export attempts even if deletion fails
         
-        for book in selected_books:
-            book_title = book.get("title", _("Unknown"))
-            
-            # Create deck
-            if create_subdecks:
-                deck_name = self.anki.create_deck_hierarchy(parent_deck, book_title)
-            else:
-                deck_name = parent_deck
-                if not self.anki.deck_exists(deck_name):
-                    self.anki.create_deck(deck_name)
-            
-            # Prepare highlights for this book
-            highlights = self._prepare_highlights([book])
-            
-            if not highlights:
-                all_errors.append(_("Skipped book '{}' because it has no non-empty highlights." ).format(book_title))
-                continue
-            
+        for book_title, groups in book_entries:
             # Build tags
             tags = []
             if self.add_tags_chk.isChecked():
                 tags.append("KOHighlights")
                 safe_title = book_title.replace(" ", "_").replace("::", "_")
                 tags.append(f"book::{safe_title}")
-            
-            # Export
-            try:
-                success, fail, errors = self.anki.bulk_add_highlights(
-                    deck_name,
-                    model_name,
-                    highlights,
-                    field_mapping,
-                    tags,
-                    self.allow_duplicates_chk.isChecked(),
-                    lambda c, t: self._update_progress(c, t, book_title),
-                    front_content=self.settings.get("front_content", "comment")
-                )
-                total_success += success
-                total_fail += fail
-                all_errors.extend(errors)
-            except AnkiConnectError as e:
-                all_errors.append(f"{book_title}: {str(e)}")
-                total_fail += len(highlights)
+
+            for deck_name, highlights in groups.items():
+                if not self.anki.deck_exists(deck_name):
+                    self.anki.create_deck(deck_name)
+
+                # Export
+                try:
+                    success, fail, errors = self.anki.bulk_add_highlights(
+                        deck_name,
+                        model_name,
+                        highlights,
+                        field_mapping,
+                        tags,
+                        self.allow_duplicates_chk.isChecked(),
+                        lambda c, t: self._update_progress(c, t, book_title),
+                        front_content=self.settings.get("front_content", "highlight")
+                    )
+                    total_success += success
+                    total_fail += fail
+                    all_errors.extend(errors)
+                except AnkiConnectError as e:
+                    all_errors.append(f"{book_title}: {str(e)}")
+                    total_fail += len(highlights)
         
         # Show results
         self.progress_frame.setVisible(False)

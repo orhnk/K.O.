@@ -10,10 +10,13 @@ from boot_config import *
 from boot_config import _
 from anki_connect import (AnkiConnect, AnkiConnectError, get_anki_connect,
                           DEFAULT_ANKI_URL, DEFAULT_NOTE_TYPE, DEFAULT_FIELD_MAPPINGS,
-                          MAKHFOUZ_NOTE_TYPE)
+                          MAKHFOUZ_NOTE_TYPE, DEFAULT_DECK_NAME, parse_deck_directive)
 from anki_ui import AnkiExportDialog, AnkiPrefsWidget
 
 __author__ = "KOHighlights"
+
+# Bump when the meaning of a persisted setting changes
+SETTINGS_VERSION = 1
 
 
 class AnkiIntegration:
@@ -50,9 +53,10 @@ class AnkiIntegration:
             "include_page": True,
             "include_date": False,
             "show_export_dialog": True,
-            "front_content": "comment",  # options: comment, highlight
+            "front_content": "highlight",  # options: highlight, comment
             "overwrite_deck": False,
-            "field_mappings": DEFAULT_FIELD_MAPPINGS.copy()
+            "field_mappings": DEFAULT_FIELD_MAPPINGS.copy(),
+            "settings_version": SETTINGS_VERSION
         }
     
     def get_settings(self) -> dict:
@@ -65,8 +69,12 @@ class AnkiIntegration:
     
     def load_settings(self, app_config: dict):
         """Load Anki settings from app configuration."""
-        anki_config = app_config.get("anki_settings", {})
+        anki_config = dict(app_config.get("anki_settings", {}))
+        if anki_config and "settings_version" not in anki_config:
+            # Older builds always rendered the bookmark/comment on the card front.
+            anki_config["front_content"] = "highlight"
         self._settings.update(anki_config)
+        self._settings["settings_version"] = SETTINGS_VERSION
     
     def save_settings(self) -> dict:
         """Return settings dictionary for saving."""
@@ -205,13 +213,17 @@ class AnkiIntegration:
         else:
             ref_page = page
         
+        comment = high_data.get("note", "").replace("\\\n", "\n")
+        deck, comment = parse_deck_directive(comment)
+
         return {
             "text": high_data.get("text", "").replace("\\\n", "\n"),
             "highlight": high_data.get("text", "").replace("\\\n", "\n"),  # Alias for Anki
             "chapter": high_data.get("chapter", ""),
-            "comment": high_data.get("note", "").replace("\\\n", "\n"),
+            "comment": comment,
             "date": high_data.get("datetime", ""),
             "page": str(ref_page if self.base.show_ref_pg else page),
+            "deck": deck,
             "idx": idx
         }
     
@@ -243,6 +255,8 @@ class AnkiIntegration:
                             comment = bkm_text.replace("\\\n", "\n")
                     break
             
+            deck, comment = parse_deck_directive(comment)
+
             return {
                 "text": text,
                 "highlight": text,  # Alias for Anki
@@ -250,6 +264,7 @@ class AnkiIntegration:
                 "comment": comment,
                 "date": high_data.get("datetime", ""),
                 "page": str(page),
+                "deck": deck,
                 "page_id": page_id
             }
         except (KeyError, TypeError):
@@ -344,57 +359,66 @@ class AnkiIntegration:
             total_success = 0
             total_fail = 0
 
-            # Optionally delete target deck(s) before export
-            if overwrite_deck:
-                deck_names_to_delete = set()
-                for book in books_data:
-                    book_title = book.get("title", "")
-                    if create_subdecks:
-                        safe_title = anki._sanitize_deck_name(book_title)
-                        deck_name = f"{parent_deck}::{safe_title}" if parent_deck else safe_title
-                    else:
-                        deck_name = parent_deck
-                    deck_names_to_delete.add(deck_name)
-                if deck_names_to_delete:
-                    anki.delete_decks(list(deck_names_to_delete), cards_too=True)
-            
+            # Normalize deck directives/book info and group highlights per target deck
+            book_entries = []
             for book in books_data:
                 book_title = book.get("title", "")
-                
-                # Create deck
+                highlights = book.get("highlights", [])
+
                 if create_subdecks:
-                    deck_name = anki.create_deck_hierarchy(parent_deck, book_title)
+                    default_deck = anki.create_deck_hierarchy(parent_deck, book_title)
                 else:
-                    deck_name = parent_deck
-                    if not anki.deck_exists(deck_name):
-                        anki.create_deck(deck_name)
-                
+                    default_deck = parent_deck or DEFAULT_DECK_NAME
+                    if not anki.deck_exists(default_deck):
+                        anki.create_deck(default_deck)
+
+                for highlight in highlights:
+                    deck, comment = parse_deck_directive(highlight.get("comment", ""))
+                    highlight["comment"] = comment
+                    if deck:
+                        highlight["deck"] = deck
+                    highlight["book_title"] = book_title
+                    highlight["author"] = book.get("author", "")
+
+                groups = {}
+                for highlight in highlights:
+                    group_deck = highlight.get("deck") or default_deck
+                    groups.setdefault(group_deck, []).append(highlight)
+                book_entries.append((book, groups))
+
+            # Optionally delete target deck(s) before export
+            if overwrite_deck:
+                deck_names_to_delete = {deck for _, groups in book_entries for deck in groups}
+                if deck_names_to_delete:
+                    anki.delete_decks(list(deck_names_to_delete), cards_too=True)
+
+            for book, groups in book_entries:
+                book_title = book.get("title", "")
+
                 # Prepare tags
                 tags = []
                 if add_tags:
                     tags.append("KOHighlights")
                     safe_title = book_title.replace(" ", "_").replace("::", "_")
                     tags.append(f"book::{safe_title}")
-                
-                # Add book info to highlights
-                for highlight in book.get("highlights", []):
-                    highlight["book_title"] = book_title
-                    highlight["author"] = book.get("author", "")
-                
-                # Export
-                success, fail, _ = anki.bulk_add_highlights(
-                    deck_name,
-                    model_name,
-                    book.get("highlights", []),
-                    field_mapping,
-                    tags,
-                    allow_duplicates,
-                    progress_callback=None,
-                    front_content=self._settings.get("front_content", "comment")
-                )
-                
-                total_success += success
-                total_fail += fail
+
+                for deck_name, highlights in groups.items():
+                    if not anki.deck_exists(deck_name):
+                        anki.create_deck(deck_name)
+
+                    success, fail, _errors = anki.bulk_add_highlights(
+                        deck_name,
+                        model_name,
+                        highlights,
+                        field_mapping,
+                        tags,
+                        allow_duplicates,
+                        progress_callback=None,
+                        front_content=self._settings.get("front_content", "highlight")
+                    )
+
+                    total_success += success
+                    total_fail += fail
             
             if total_success > 0:
                 msg = _("{} cards exported to Anki!").format(total_success)
